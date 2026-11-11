@@ -1,0 +1,1167 @@
+// Copyright 2023 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package webhook
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/atomic"
+
+	"github.com/livekit/protocol/auth"
+	"github.com/livekit/protocol/livekit"
+	"github.com/livekit/protocol/logger"
+)
+
+const (
+	testAPIKey           = "mykey"
+	testAPISecret        = "mysecret"
+	testAddr             = ":8765"
+	testUrl              = "http://localhost:8765"
+	webhookCheckInterval = 100 * time.Millisecond
+)
+
+var authProvider = auth.NewSimpleKeyProvider(
+	testAPIKey, testAPISecret,
+)
+
+func TestWebHook(t *testing.T) {
+	InitWebhookStats(prometheus.Labels{})
+
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("test event payload", func(t *testing.T) {
+		notifier := newTestNotifier()
+		defer notifier.Stop(false)
+
+		event := &livekit.WebhookEvent{
+			Event: EventTrackPublished,
+			Participant: &livekit.ParticipantInfo{
+				Identity: "test",
+			},
+			Track: &livekit.TrackInfo{
+				Sid: "TR_abcde",
+			},
+		}
+
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		expectedUrl := "/"
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			defer wg.Done()
+			decodedEvent, err := ReceiveWebhookEvent(r, authProvider)
+			require.NoError(t, err)
+
+			require.EqualValues(t, event, decodedEvent)
+			require.Equal(t, expectedUrl, r.URL.String())
+			require.Equal(t, DefaultUserAgent, r.UserAgent())
+		}
+		require.NoError(t, notifier.QueueNotify(context.Background(), event))
+		wg.Wait()
+
+		wg.Add(1)
+		expectedUrl = "/wh"
+		require.NoError(t, notifier.QueueNotify(context.Background(), event, WithExtraWebhooks([]*livekit.WebhookConfig{&livekit.WebhookConfig{Url: "http://localhost:8765/wh"}})))
+		wg.Wait()
+
+	})
+
+	t.Run("overridden user agent", func(t *testing.T) {
+		notifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+			HTTPClientParams: HTTPClientParams{
+				UserAgent: "LiveKitCloud",
+			},
+		})
+		defer notifier.Stop(false)
+
+		ua := atomic.String{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			ua.Store(r.UserAgent())
+		}
+		require.NoError(t, notifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted}))
+		require.Eventually(
+			t,
+			func() bool {
+				return ua.Load() == "LiveKitCloud"
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+}
+
+func TestURLNotifierDropped(t *testing.T) {
+	InitWebhookStats(prometheus.Labels{})
+
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	urlNotifier := newTestNotifier()
+	defer urlNotifier.Stop(true)
+	totalDropped := atomic.Int32{}
+	totalReceived := atomic.Int32{}
+	s.handler = func(w http.ResponseWriter, r *http.Request) {
+		decodedEvent, err := ReceiveWebhookEvent(r, authProvider)
+		require.NoError(t, err)
+		totalReceived.Inc()
+		totalDropped.Add(decodedEvent.NumDropped)
+	}
+	// send multiple notifications
+	for i := 0; i < 10; i++ {
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventParticipantJoined})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+	}
+
+	time.Sleep(webhookCheckInterval)
+
+	require.Equal(t, int32(30), totalDropped.Load()+totalReceived.Load())
+	// at least one request dropped
+	require.Less(t, int32(0), totalDropped.Load())
+}
+
+func TestURLNotifierLifecycle(t *testing.T) {
+	InitWebhookStats(prometheus.Labels{})
+
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("start/stop without use", func(t *testing.T) {
+		urlNotifier := newTestNotifier()
+		urlNotifier.Stop(false)
+	})
+
+	t.Run("stop allowing to drain", func(t *testing.T) {
+		urlNotifier := newTestNotifier()
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+		for i := 0; i < 10; i++ {
+			_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		}
+		urlNotifier.Stop(false)
+		require.Eventually(t, func() bool { return numCalled.Load() == 20 }, 5*time.Second, webhookCheckInterval)
+	})
+
+	t.Run("force stop", func(t *testing.T) {
+		urlNotifier := newTestNotifier()
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+		for i := 0; i < 10; i++ {
+			_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		}
+		urlNotifier.Stop(true)
+		time.Sleep(time.Second)
+		require.Greater(t, int32(20), numCalled.Load())
+	})
+
+	t.Run("bounds each attempt by default", func(t *testing.T) {
+		n := NewURLNotifier(URLNotifierParams{URL: testUrl})
+		defer n.Stop(true)
+		require.NotZero(t, n.client.HTTPClient.Timeout)
+	})
+
+	t.Run("bounds Retry-After by RetryWaitMax", func(t *testing.T) {
+		n := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax: time.Millisecond,
+				MaxRetries:   1,
+			},
+		})
+		defer n.Stop(true)
+
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Retry-After", "315360000")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := n.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &n.params)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			require.Error(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("delivery still waiting on Retry-After")
+		}
+	})
+
+	t.Run("times out after accepting connection", func(t *testing.T) {
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax:  time.Millisecond,
+				MaxRetries:    1,
+				ClientTimeout: 100 * time.Millisecond,
+			},
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+		})
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			w.Write([]byte("ok"))
+
+			// delay the request to cause it to fail
+			time.Sleep(time.Second)
+			if r.Context().Err() == nil {
+				// inc if not canceled
+				numCalled.Inc()
+			}
+		}
+		defer urlNotifier.Stop(false)
+
+		res, err := urlNotifier.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &urlNotifier.params)
+		require.Error(t, err)
+		require.Nil(t, res)
+	})
+
+	t.Run("times out before connection", func(t *testing.T) {
+		ln, err := net.Listen("tcp", ":9987")
+		require.NoError(t, err)
+		defer ln.Close()
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       "http://localhost:9987",
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax:  time.Millisecond,
+				MaxRetries:    1,
+				ClientTimeout: 100 * time.Millisecond,
+			},
+		})
+		defer urlNotifier.Stop(false)
+
+		startedAt := time.Now()
+		res, err := urlNotifier.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &urlNotifier.params)
+		require.Error(t, err)
+		require.Nil(t, res)
+		require.Less(t, time.Since(startedAt).Seconds(), float64(2))
+	})
+}
+
+func TestURLNotifierFilter(t *testing.T) {
+	InitWebhookStats(prometheus.Labels{})
+
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("none", func(t *testing.T) {
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+			HTTPClientParams: HTTPClientParams{
+				ForceIPv4: true,
+			},
+		})
+		defer urlNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 2
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("includes", func(t *testing.T) {
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			FilterParams: FilterParams{
+				IncludeEvents: []string{EventRoomStarted},
+			},
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+		})
+		defer urlNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("excludes", func(t *testing.T) {
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			FilterParams: FilterParams{
+				ExcludeEvents: []string{EventRoomStarted},
+			},
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+		})
+		defer urlNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("includes + excludes", func(t *testing.T) {
+		urlNotifier := NewURLNotifier(URLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			FilterParams: FilterParams{
+				IncludeEvents: []string{EventRoomStarted},
+				ExcludeEvents: []string{EventRoomStarted, EventRoomFinished},
+			},
+			Config: URLNotifierConfig{
+				QueueSize: 20,
+			},
+		})
+		defer urlNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		// EventRoomStarted should be allowed as IncludeEvents take precedence
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = urlNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+}
+
+func newTestNotifier() *URLNotifier {
+	return NewURLNotifier(URLNotifierParams{
+		URL:       testUrl,
+		APIKey:    testAPIKey,
+		APISecret: testAPISecret,
+		Config: URLNotifierConfig{
+			QueueSize: 20,
+		},
+	})
+}
+
+// --------------------------------------------
+
+func TestResourceWebHook(t *testing.T) {
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("test event payload", func(t *testing.T) {
+		resourceURLNotifier, err := NewDefaultNotifier(
+			WebHookConfig{
+				URLs:   []string{testUrl},
+				APIKey: testAPIKey,
+			},
+			authProvider,
+		)
+		require.NoError(t, err)
+		defer resourceURLNotifier.Stop(false)
+
+		event := &livekit.WebhookEvent{
+			Event: EventTrackPublished,
+			Participant: &livekit.ParticipantInfo{
+				Identity: "test",
+			},
+			Track: &livekit.TrackInfo{
+				Sid: "TR_abcde",
+			},
+		}
+
+		wg := sync.WaitGroup{}
+		wg.Add(1)
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			defer wg.Done()
+			decodedEvent, err := ReceiveWebhookEvent(r, authProvider)
+			require.NoError(t, err)
+
+			require.EqualValues(t, event, decodedEvent)
+			require.Equal(t, DefaultUserAgent, r.UserAgent())
+		}
+		require.NoError(t, resourceURLNotifier.QueueNotify(context.Background(), event))
+		wg.Wait()
+	})
+
+	t.Run("overridden user agent", func(t *testing.T) {
+		resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			HTTPClientParams: HTTPClientParams{
+				UserAgent: "LiveKitCloud",
+			},
+		})
+		defer resourceURLNotifier.Stop(false)
+
+		ua := atomic.String{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			ua.Store(r.UserAgent())
+		}
+		require.NoError(t, resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted}))
+		require.Eventually(
+			t,
+			func() bool {
+				return ua.Load() == "LiveKitCloud"
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+}
+
+func TestResourceURLNotifierDropped(t *testing.T) {
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("depth drop", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(time.Minute, time.Minute, 5)
+		defer resourceURLNotifier.Stop(true)
+		totalDropped := atomic.Int32{}
+		totalReceived := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			_, err := ReceiveWebhookEvent(r, authProvider)
+			require.NoError(t, err)
+			totalReceived.Inc()
+		}
+		// send multiple notifications
+		for i := 0; i < 10; i++ {
+			err := resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			if err == errQueueFull {
+				totalDropped.Inc()
+			}
+			err = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventParticipantJoined})
+			if err == errQueueFull {
+				totalDropped.Inc()
+			}
+			err = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+			if err == errQueueFull {
+				totalDropped.Inc()
+			}
+		}
+
+		time.Sleep(webhookCheckInterval)
+
+		require.Eventually(
+			t,
+			func() bool {
+				return totalDropped.Load()+totalReceived.Load() == 30
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+		// at least one request dropped, but not all dropped
+		require.Less(t, int32(0), totalDropped.Load())
+		require.Less(t, int32(0), totalReceived.Load())
+	})
+
+	t.Run("age drop", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(time.Minute, 10*time.Millisecond, 500)
+		defer resourceURLNotifier.Stop(true)
+		totalReceived := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(5 * time.Millisecond)
+			_, err := ReceiveWebhookEvent(r, authProvider)
+			require.NoError(t, err)
+			totalReceived.Inc()
+		}
+		// send multiple notifications
+		for i := 0; i < 10; i++ {
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			time.Sleep(time.Millisecond)
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventParticipantJoined})
+			time.Sleep(time.Millisecond)
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+			time.Sleep(time.Millisecond)
+		}
+
+		time.Sleep(2 * webhookCheckInterval)
+
+		// at least one request dropped
+		require.Greater(t, int32(30), totalReceived.Load())
+		require.Less(t, int32(0), totalReceived.Load())
+	})
+
+	t.Run("resource queue timeout", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(5*time.Millisecond, time.Minute, 500)
+		defer resourceURLNotifier.Stop(true)
+		totalReceived := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			_, err := ReceiveWebhookEvent(r, authProvider)
+			require.NoError(t, err)
+			totalReceived.Inc()
+		}
+
+		// check that resource queues change for the same event key
+		for i := 0; i < 3; i++ {
+			var rq *resourceQueue
+
+			roomName := fmt.Sprintf("room%d", i)
+
+			_ = resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{
+					Event: EventRoomStarted,
+					Room: &livekit.Room{
+						Name: roomName,
+					},
+				},
+			)
+			resourceURLNotifier.mu.RLock()
+			rqi := resourceURLNotifier.resourceQueues[roomName]
+			resourceURLNotifier.mu.RUnlock()
+			require.NotNil(t, rqi)
+			require.NotNil(t, rqi.resourceQueue)
+			require.NotSame(t, rqi.resourceQueue, rq)
+			rq = rqi.resourceQueue
+			time.Sleep(10 * time.Millisecond)
+
+			_ = resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{
+					Event: EventParticipantJoined,
+					Room: &livekit.Room{
+						Name: roomName,
+					},
+				},
+			)
+			resourceURLNotifier.mu.RLock()
+			rqi = resourceURLNotifier.resourceQueues[roomName]
+			resourceURLNotifier.mu.RUnlock()
+			require.NotNil(t, rqi)
+			require.NotNil(t, rqi.resourceQueue)
+			require.NotSame(t, rqi.resourceQueue, rq)
+			rq = rqi.resourceQueue
+			time.Sleep(10 * time.Millisecond)
+
+			_ = resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{
+					Event: EventParticipantLeft,
+					Room: &livekit.Room{
+						Name: roomName,
+					},
+				},
+			)
+			resourceURLNotifier.mu.RLock()
+			rqi = resourceURLNotifier.resourceQueues[roomName]
+			resourceURLNotifier.mu.RUnlock()
+			require.NotNil(t, rqi)
+			require.NotNil(t, rqi.resourceQueue)
+			require.NotSame(t, rqi.resourceQueue, rq)
+			rq = rqi.resourceQueue //nolint:staticcheck // used in next loop iteration
+			time.Sleep(10 * time.Millisecond)
+		}
+
+		time.Sleep(webhookCheckInterval)
+
+		require.Equal(t, int32(9), totalReceived.Load())
+	})
+}
+
+func TestResourceURLNotifierLifecycle(t *testing.T) {
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("start/stop without use", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(time.Minute, 200*time.Millisecond, 50)
+		resourceURLNotifier.Stop(false)
+	})
+
+	t.Run("sweeper", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(200*time.Millisecond, 200*time.Millisecond, 50)
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+		for i := 0; i < 10; i++ {
+			roomName := fmt.Sprintf("room%d", i)
+			_ = resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{
+					Event: EventRoomStarted,
+					Room: &livekit.Room{
+						Name: roomName,
+					},
+				},
+			)
+
+			_ = resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{
+					Event: EventRoomFinished,
+					Room: &livekit.Room{
+						Name: roomName,
+					},
+				},
+			)
+		}
+
+		resourceURLNotifier.mu.RLock()
+		require.Equal(t, 10, len(resourceURLNotifier.resourceQueues))
+		resourceURLNotifier.mu.RUnlock()
+
+		time.Sleep(time.Second)
+
+		// should have reaped after some time
+		resourceURLNotifier.mu.RLock()
+		require.Equal(t, 0, len(resourceURLNotifier.resourceQueues))
+		resourceURLNotifier.mu.RUnlock()
+
+		require.Equal(t, int32(20), numCalled.Load())
+	})
+
+	t.Run("stop allowing to drain", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(time.Minute, time.Minute, 50)
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(10 * time.Millisecond)
+			numCalled.Inc()
+		}
+		// half the events in one resource queue, half spread over others
+		for i := 0; i < 5; i++ {
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		}
+		for i := 0; i < 5; i++ {
+			room := &livekit.Room{Name: fmt.Sprintf("room%d", i)}
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted, Room: room})
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished, Room: room})
+		}
+		resourceURLNotifier.mu.RLock()
+		require.Equal(t, 6, len(resourceURLNotifier.resourceQueues))
+		resourceURLNotifier.mu.RUnlock()
+		// returns once the queued events in every resource queue have been sent
+		resourceURLNotifier.Stop(false)
+		require.Equal(t, int32(20), numCalled.Load())
+	})
+
+	t.Run("force stop", func(t *testing.T) {
+		resourceURLNotifier := newTestResourceNotifier(time.Minute, 200*time.Millisecond, 50)
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+		for i := 0; i < 10; i++ {
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+			_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		}
+		resourceURLNotifier.Stop(true)
+		time.Sleep(time.Second)
+		require.Greater(t, int32(20), numCalled.Load())
+	})
+
+	t.Run("bounds each attempt by default", func(t *testing.T) {
+		n := NewResourceURLNotifier(ResourceURLNotifierParams{URL: testUrl})
+		defer n.Stop(true)
+		require.NotZero(t, n.client.HTTPClient.Timeout)
+	})
+
+	t.Run("bounds Retry-After by RetryWaitMax", func(t *testing.T) {
+		n := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax: time.Millisecond,
+				MaxRetries:   1,
+			},
+		})
+		defer n.Stop(true)
+
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Retry-After", "315360000")
+			w.WriteHeader(http.StatusTooManyRequests)
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := n.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &n.params)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			require.Error(t, err)
+		case <-time.After(2 * time.Second):
+			t.Fatal("delivery still waiting on Retry-After")
+		}
+	})
+
+	t.Run("times out after accepting connection", func(t *testing.T) {
+		params := ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax:  time.Millisecond,
+				MaxRetries:    1,
+				ClientTimeout: 100 * time.Millisecond,
+			},
+		}
+
+		resourceURLNotifier := NewResourceURLNotifier(params)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(200)
+			w.Write([]byte("ok"))
+
+			// delay the request to cause it to fail
+			time.Sleep(time.Second)
+			if r.Context().Err() == nil {
+				// inc if not canceled
+				numCalled.Inc()
+			}
+		}
+		defer resourceURLNotifier.Stop(false)
+
+		res, err := resourceURLNotifier.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &params)
+		require.Error(t, err)
+		require.Nil(t, res)
+	})
+
+	t.Run("times out before connection", func(t *testing.T) {
+		ln, err := net.Listen("tcp", ":9987")
+		require.NoError(t, err)
+		defer ln.Close()
+
+		params := ResourceURLNotifierParams{
+			URL:       "http://localhost:9987",
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			HTTPClientParams: HTTPClientParams{
+				RetryWaitMax:  time.Millisecond,
+				MaxRetries:    1,
+				ClientTimeout: 100 * time.Millisecond,
+			},
+		}
+
+		resourceURLNotifier := NewResourceURLNotifier(params)
+		defer resourceURLNotifier.Stop(false)
+
+		startedAt := time.Now()
+		res, err := resourceURLNotifier.send(&livekit.WebhookEvent{Event: EventRoomStarted}, &params)
+		require.Error(t, err)
+		require.Nil(t, res)
+		require.Less(t, time.Since(startedAt).Seconds(), float64(2))
+	})
+}
+
+func TestResourceURLNotifierFilter(t *testing.T) {
+	s := newServer(testAddr)
+	require.NoError(t, s.Start())
+	defer s.Stop()
+
+	t.Run("none", func(t *testing.T) {
+		resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			FilterParams: FilterParams{},
+		})
+		defer resourceURLNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 2
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("includes", func(t *testing.T) {
+		resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			FilterParams: FilterParams{
+				IncludeEvents: []string{EventRoomStarted},
+			},
+		})
+		defer resourceURLNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("excludes", func(t *testing.T) {
+		resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			FilterParams: FilterParams{
+				ExcludeEvents: []string{EventRoomStarted},
+			},
+		})
+		defer resourceURLNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+
+	t.Run("includes + excludes", func(t *testing.T) {
+		resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{
+			URL:       testUrl,
+			APIKey:    testAPIKey,
+			APISecret: testAPISecret,
+			Config: ResourceURLNotifierConfig{
+				MaxAge:   200 * time.Millisecond,
+				MaxDepth: 50,
+			},
+			FilterParams: FilterParams{
+				IncludeEvents: []string{EventRoomStarted},
+				ExcludeEvents: []string{EventRoomStarted, EventRoomFinished},
+			},
+		})
+		defer resourceURLNotifier.Stop(false)
+
+		numCalled := atomic.Int32{}
+		s.handler = func(w http.ResponseWriter, r *http.Request) {
+			numCalled.Inc()
+		}
+
+		// EventRoomStarted should be allowed as IncludeEvents take precedence
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		_ = resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomFinished})
+		require.Eventually(
+			t,
+			func() bool {
+				return numCalled.Load() == 1
+			},
+			5*time.Second,
+			webhookCheckInterval,
+		)
+	})
+}
+
+func TestResourceURLNotifierQueueNotifyError(t *testing.T) {
+	resourceURLNotifier := NewResourceURLNotifier(ResourceURLNotifierParams{URL: testUrl})
+
+	// a failed call must not keep the notifier locked
+	errs := make(chan error, 4)
+	go func() {
+		defer close(errs)
+		for range 2 {
+			errs <- resourceURLNotifier.QueueNotify(context.Background(), &livekit.WebhookEvent{Event: EventRoomStarted})
+		}
+		resourceURLNotifier.SetKeys(testAPIKey, testAPISecret)
+		for range 2 {
+			errs <- resourceURLNotifier.QueueNotify(
+				context.Background(),
+				&livekit.WebhookEvent{Event: EventRoomStarted},
+				WithExtraWebhooks([]*livekit.WebhookConfig{{Url: testUrl}, {Url: testUrl}}),
+			)
+		}
+	}()
+
+	for i := range 4 {
+		select {
+		case err := <-errs:
+			if i < 2 {
+				require.ErrorIs(t, err, errNoKey)
+			} else {
+				require.Error(t, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("QueueNotify blocked after %d failed calls", i)
+		}
+	}
+
+	// not deferred, Stop would block on a notifier that is still locked
+	resourceURLNotifier.Stop(true)
+}
+
+func newTestResourceNotifier(timeout time.Duration, maxAge time.Duration, maxDepth int) *ResourceURLNotifier {
+	return NewResourceURLNotifier(ResourceURLNotifierParams{
+		URL:       testUrl,
+		APIKey:    testAPIKey,
+		APISecret: testAPISecret,
+		Timeout:   timeout,
+		Config: ResourceURLNotifierConfig{
+			MaxAge:   maxAge,
+			MaxDepth: maxDepth,
+		},
+	})
+}
+
+// ---------------------------------------
+
+type testServer struct {
+	handler func(w http.ResponseWriter, r *http.Request)
+	server  *http.Server
+}
+
+func newServer(addr string) *testServer {
+	s := &testServer{}
+	s.server = &http.Server{
+		Addr:    addr,
+		Handler: s,
+	}
+	return s
+}
+
+func (s *testServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if s.handler != nil {
+		s.handler(w, r)
+	}
+}
+
+func (s *testServer) Start() error {
+	l, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return err
+	}
+	go s.server.Serve(l)
+	return nil
+}
+
+func (s *testServer) Stop() {
+	_ = s.server.Shutdown(context.Background())
+}
+
+func TestRedactURL(t *testing.T) {
+	for in, out := range map[string]string{
+		"http://localhost:8765":                    "http://localhost:8765",
+		"https://example.com/hook?code=SECRET&x=":  "https://example.com/hook?code={...}&x=",
+		"https://lk:PASSWORD@example.com/hook?k=S": "https://{...}@example.com/hook?k={...}",
+		"http://TOKEN@example.com:x/hook":          "http://{...}@example.com:x/hook",
+		"https://example.com/users/a@b?token=S":    "https://example.com/users/a@b?token={...}",
+	} {
+		require.Equal(t, out, redactURL(in), in)
+	}
+}
+
+type logRecorder struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (r *logRecorder) Logf(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fmt.Fprintf(&r.buf, format, args...)
+}
+func (r *logRecorder) Log(args ...any) { r.Logf("%s", fmt.Sprint(args...)) }
+func (r *logRecorder) Cleanup(func())  {}
+func (r *logRecorder) String() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.buf.String()
+}
+
+// rawStatusEndpoint answers every request with a status text of statusLen bytes, which net/http servers cannot send
+func rawStatusEndpoint(t *testing.T, statusLen int) string {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				_, _ = conn.Read(make([]byte, 64<<10))
+				_, _ = conn.Write([]byte("HTTP/1.1 200 " + strings.Repeat("x", statusLen) + "\r\nContent-Length: 0\r\n\r\n"))
+			}()
+		}
+	}()
+	return l.Addr().String()
+}
+
+// delivery logs must not carry receiver credentials from the URL or text chosen by the endpoint
+func TestDeliveryLogs(t *testing.T) {
+	InitWebhookStats(prometheus.Labels{})
+
+	clientParams := HTTPClientParams{MaxRetries: 1, RetryWaitMin: time.Millisecond, RetryWaitMax: time.Millisecond}
+	event := &livekit.WebhookEvent{Event: EventRoomStarted, Room: &livekit.Room{Name: "room"}}
+
+	// under the response head limit the delivery succeeds, over it the delivery fails
+	for msg, statusLen := range map[string]int{"sent webhook": 32 << 10, "failed to send webhook": 1 << 20} {
+		url := "http://lk:PASSWORD@" + rawStatusEndpoint(t, statusLen) + "/hook?code=SECRET"
+		check := func(t *testing.T, log string) {
+			require.Contains(t, log, msg)
+			require.NotContains(t, log, "PASSWORD")
+			require.NotContains(t, log, "SECRET")
+			require.Less(t, len(log), 10_000)
+		}
+
+		t.Run(msg+"/URLNotifier", func(t *testing.T) {
+			log := &logRecorder{}
+			n := NewURLNotifier(URLNotifierParams{
+				HTTPClientParams: clientParams,
+				Logger:           logger.NewTestLogger(log),
+				URL:              url,
+				APIKey:           testAPIKey,
+				APISecret:        testAPISecret,
+			})
+			require.NoError(t, n.QueueNotify(context.Background(), event))
+			n.Stop(false)
+			check(t, log.String())
+		})
+
+		t.Run(msg+"/ResourceURLNotifier", func(t *testing.T) {
+			log := &logRecorder{}
+			n := NewResourceURLNotifier(ResourceURLNotifierParams{
+				HTTPClientParams: clientParams,
+				Logger:           logger.NewTestLogger(log),
+				URL:              url,
+				APIKey:           testAPIKey,
+				APISecret:        testAPISecret,
+			})
+			require.NoError(t, n.QueueNotify(context.Background(), event))
+			n.Stop(false)
+			check(t, log.String())
+		})
+	}
+}
