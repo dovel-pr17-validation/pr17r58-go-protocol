@@ -1,5 +1,45 @@
 # github.com/livekit/protocol
 
+## 1.53.5
+
+### Patch Changes
+
+- utils: CloneProtoRedacted no longer panics on unannotated scalar-valued maps
+
+- Add `lk.connector.requestTime` and `lk.connector.answerTime` connector participant attributes, with helpers to set and parse them
+
+- datatrack: size marshalled extensions from the extension list so a stale `ExtensionsSize` cannot corrupt the marshalled header.  
+  datatrack: reset extensions on each `Unmarshal` and reject packets that repeat an extension ID.
+
+- decodebudget: price protojson well-known types, extensions, numbers, escapes and maps, wire-type mismatches and dynamicpb destinations; cut Estimate's own allocation
+
+- guid: invalid IDs marshal to a sentinel and malformed input unmarshals to the zero ID instead of panicking
+
+- `utils.MetricsBatchBuilder.Merge` rejects out-of-range `str_data` indexes on 32-bit builds.
+
+- auth: UpdateFromPermission and MatchesPermission ignore agent, so a permission update cannot grant it
+
+- `rtputil.RTPConverter` returns a zero duration when the clock rate is 0.
+
+- `sdp.CodecsFromMediaDescription` builds the codec map once and returns each payload type once, even when the m= line repeats it.  
+  `SDPFragment.PatchICECredentialAndCandidatesIntoSDP` adds the fragment's candidates only to the media section with the fragment's mid.
+
+- `signalling.FromProtoSessionDescription` returns an empty description for a nil input, the same zero value that `ToProtoSessionDescription` maps to nil.
+
+- `SimulationRun.JobMetrics.Turn.entities`: each key-entity saying in the turn, with what the listener heard and whether it was recognized.  
+  `SimulationRun.JobMetrics.Turn.item_id`: the agent's chat item id for the turn's first message, so a turn can link to its place in the stored transcript.
+
+- Add `sip_source_call_id` to `CreateSIPParticipantRequest`, to forward the caller ID of a live inbound call (cloud only)
+
+- Add the telemetry semantic-conventions registry under `otel/`
+
+- Group generated Python telemetry attribute values in plain classes while preserving string values.
+
+- Group generated TypeScript telemetry attribute values in const objects with matching union types.
+
+- webhook: bound each delivery attempt by default (10 s client timeout when none is set) and cap a `Retry-After` wait at `RetryWaitMax`.  
+  webhook: mask userinfo and query values of the delivery URL in logs and send errors, log `http.StatusText` instead of the endpoint's status text, and cap the response head at 64 KiB.
+
 ## 1.53.4
 
 ### Patch Changes

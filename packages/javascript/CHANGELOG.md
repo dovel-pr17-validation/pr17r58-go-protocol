@@ -1,5 +1,30 @@
 # @livekit/protocol
 
+## 1.53.5
+
+### Patch Changes
+
+- Add self-hosted join counts and per-job join values (`origin`, dispatch trigger, worker kind, outcome, scope, latency) to the agents observability schema
+
+- Add `lk.connector.requestTime` and `lk.connector.answerTime` connector participant attributes, with helpers to set and parse them
+
+- Add `attempts`, `first_started_at` and `agent_failed_attempts_ns` to `JobState`, so every node that syncs a job sees how many attempts it took, when the first one started, and how long the attempts the agent's own code failed took
+
+- Add `workers_asked` to `JobState`: how many workers were asked to take the current attempt, the one that took it included
+
+- Add the `no_user` latency scope to the agents observability schema, for an agent join that no user waited for
+
+- `SimulationRun.JobMetrics.Turn.entities`: each key-entity saying in the turn, with what the listener heard and whether it was recognized.  
+  `SimulationRun.JobMetrics.Turn.item_id`: the agent's chat item id for the turn's first message, so a turn can link to its place in the stored transcript.
+
+- Add `sip_source_call_id` to `CreateSIPParticipantRequest`, to forward the caller ID of a live inbound call (cloud only)
+
+- Add the telemetry semantic-conventions registry under `otel/`
+
+- Group generated Python telemetry attribute values in plain classes while preserving string values.
+
+- Group generated TypeScript telemetry attribute values in const objects with matching union types.
+
 ## 1.53.4
 
 ### Patch Changes
